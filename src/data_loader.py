@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from datasets import Dataset
-from config import DataConfig
+from .config import DataConfig
 
 
 class DataLoader:
@@ -187,6 +187,108 @@ RULES:
 
 class LSTFileParser:
     """Parse .lst (listing) files from PIC assemblers"""
+    
+    @staticmethod
+    def extract_functions_from_lst(file_path: str, strip_comments: bool = True) -> Dict[str, Dict[str, any]]:
+        """
+        Extract individual functions from .lst file for function-by-function processing
+        
+        Args:
+            file_path: Path to .lst file
+            strip_comments: Whether to remove comments
+            
+        Returns:
+            Dictionary mapping function names to their assembly code and metadata
+        """
+        path = Path(file_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"File not found: {file_path}")
+        
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            lines = f.readlines()
+        
+        functions = {}
+        current_function = None
+        current_assembly = []
+        in_code_section = False
+        function_order = []  # Track order of functions
+        
+        for line in lines:
+            line_stripped = line.strip()
+            
+            # Skip empty lines and comments
+            if not line_stripped or line_stripped.startswith(';'):
+                continue
+            
+            # Detect function start - pattern: _functionname: or functionname:
+            func_match = re.match(r'^([_a-zA-Z][_a-zA-Z0-9]*):.*$', line_stripped)
+            
+            if func_match:
+                # Save previous function if exists
+                if current_function and current_assembly:
+                    functions[current_function]['assembly'] = '\n'.join(current_assembly)
+                    functions[current_function]['line_count'] = len(current_assembly)
+                
+                # Start new function
+                current_function = func_match.group(1)
+                function_order.append(current_function)
+                functions[current_function] = {
+                    'name': current_function,
+                    'assembly': '',
+                    'line_count': 0,
+                    'order': len(function_order)
+                }
+                current_assembly = []
+                in_code_section = True
+                continue
+            
+            # If we're in a function, collect assembly lines
+            if in_code_section and current_function:
+                # Parse instruction line
+                match = re.match(r'^(?:[0-9A-Fa-f]{4}\s+)?(?:[0-9A-Fa-f]{4,}\s+)?(.+)$', line_stripped)
+                
+                if match:
+                    instruction_part = match.group(1).strip()
+                    
+                    # Skip empty or comment-only lines
+                    if not instruction_part or instruction_part.startswith(';'):
+                        continue
+                    
+                    # Strip comments if requested
+                    if strip_comments and ';' in instruction_part:
+                        instruction_part = instruction_part.split(';')[0].strip()
+                    
+                    # Skip assembler directives
+                    if any(instruction_part.upper().startswith(d) for d in 
+                          ['LIST', 'INCLUDE', 'END', 'ORG', '__CONFIG', 'PROCESSOR', 
+                           'RADIX', 'ERRORLEVEL', 'PAGEWIDTH', 'OPT', 'PSECT', 'DABS',
+                           'GLOBAL', 'SIGNAT', 'FNROOT', 'FNCALL', 'FNCONF', 'FNSIZE']):
+                        continue
+                    
+                    # Check if we reached metadata sections (end of code)
+                    if any(section in line_stripped for section in 
+                          ['Data Sizes:', 'Auto Spaces:', 'Call Graph', 'Symbol Table',
+                           'Pointer List', 'Critical Paths', 'Address spaces:']):
+                        in_code_section = False
+                        if current_function and current_assembly:
+                            functions[current_function]['assembly'] = '\n'.join(current_assembly)
+                            functions[current_function]['line_count'] = len(current_assembly)
+                        break
+                    
+                    if instruction_part:
+                        current_assembly.append(instruction_part)
+        
+        # Save last function
+        if current_function and current_assembly:
+            functions[current_function]['assembly'] = '\n'.join(current_assembly)
+            functions[current_function]['line_count'] = len(current_assembly)
+        
+        # Filter out empty or very small functions (likely just labels)
+        functions = {name: data for name, data in functions.items() 
+                    if data['line_count'] >= 3}  # At least 3 lines of actual code
+        
+        return functions
     
     @staticmethod
     def parse_lst_file(file_path: str, strip_comments: bool = True) -> str:

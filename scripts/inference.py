@@ -101,6 +101,223 @@ class PICDecompiler:
                        input_file: str, 
                        output_file: Optional[str] = None,
                        function_name: str = "",
+                       context: str = "",
+                       function_by_function: bool = True) -> Dict:
+        """
+        Decompile a single .lst file
+        
+        Args:
+            input_file: Path to input .lst file
+            output_file: Optional output file path (default: input_file.c)
+            function_name: Optional function name
+            context: Optional context
+            function_by_function: Process each function separately (recommended for large files)
+            
+        Returns:
+            Dictionary with results
+        """
+        print(f"\nProcessing: {input_file}")
+        
+        # Check if function-by-function processing is requested
+        if function_by_function:
+            return self._decompile_file_by_functions(input_file, output_file, context)
+        
+        # Otherwise, process as single unit (original behavior)
+        # Parse LST file
+        try:
+            assembly_code = LSTFileParser.parse_lst_file(
+                input_file, 
+                strip_comments=self.config.strip_comments
+            )
+            print(f"✓ Parsed {len(assembly_code.splitlines())} lines of assembly")
+        except Exception as e:
+            print(f"✗ Failed to parse file: {e}")
+            return {"status": "error", "error": str(e)}
+        
+        # Decompile
+        print("Generating C code...")
+        start_time = datetime.now()
+        
+        try:
+            c_code = self.decompile(assembly_code, function_name, context)
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            print(f"✓ Generated C code in {elapsed_time:.2f}s")
+        except Exception as e:
+            print(f"✗ Decompilation failed: {e}")
+            return {"status": "error", "error": str(e)}
+        
+        # Save output
+        if output_file:
+            output_path = Path(output_file)
+        else:
+            input_path = Path(input_file)
+            output_path = input_path.with_suffix('.c')
+        
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_path, 'w') as f:
+                f.write(c_code)
+            
+            print(f"✓ Saved to: {output_path}")
+        except Exception as e:
+            print(f"✗ Failed to save output: {e}")
+            return {"status": "error", "error": str(e)}
+        
+        return {
+            "status": "success",
+            "input_file": str(input_file),
+            "output_file": str(output_path),
+            "assembly_lines": len(assembly_code.splitlines()),
+            "c_code_lines": len(c_code.splitlines()),
+            "processing_time_seconds": elapsed_time,
+            "c_code": c_code
+        }
+    
+    def _decompile_file_by_functions(self, 
+                                     input_file: str, 
+                                     output_file: Optional[str] = None,
+                                     context: str = "") -> Dict:
+        """
+        Decompile file by processing each function separately
+        
+        Args:
+            input_file: Path to input .lst file
+            output_file: Optional output file path
+            context: Optional context information
+            
+        Returns:
+            Dictionary with results
+        """
+        # Extract functions from LST file
+        try:
+            functions = LSTFileParser.extract_functions_from_lst(
+                input_file,
+                strip_comments=self.config.strip_comments
+            )
+            print(f"✓ Extracted {len(functions)} functions from assembly")
+        except Exception as e:
+            print(f"✗ Failed to extract functions: {e}")
+            return {"status": "error", "error": str(e)}
+        
+        if not functions:
+            print("⚠️  No functions found in file")
+            return {"status": "error", "error": "No functions found"}
+        
+        # Process each function
+        print("\nDecompiling functions...")
+        decompiled_functions = []
+        total_start_time = datetime.now()
+        
+        # Sort by order to maintain correct sequence
+        sorted_functions = sorted(functions.items(), key=lambda x: x[1]['order'])
+        
+        for func_name, func_data in sorted_functions:
+            print(f"\n  Processing: {func_name} ({func_data['line_count']} lines)")
+            
+            try:
+                start_time = datetime.now()
+                c_code = self.decompile(
+                    func_data['assembly'],
+                    function_name=func_name,
+                    context=context
+                )
+                elapsed = (datetime.now() - start_time).total_seconds()
+                
+                decompiled_functions.append({
+                    'name': func_name,
+                    'c_code': c_code,
+                    'assembly_lines': func_data['line_count'],
+                    'processing_time': elapsed
+                })
+                
+                print(f"  ✓ {func_name} completed in {elapsed:.2f}s")
+                
+            except Exception as e:
+                print(f"  ✗ {func_name} failed: {e}")
+                decompiled_functions.append({
+                    'name': func_name,
+                    'c_code': f"// Failed to decompile {func_name}: {str(e)}",
+                    'assembly_lines': func_data['line_count'],
+                    'processing_time': 0,
+                    'error': str(e)
+                })
+        
+        total_elapsed = (datetime.now() - total_start_time).total_seconds()
+        
+        # Combine all functions into single C file
+        combined_c_code = self._combine_functions_to_c(decompiled_functions)
+        
+        # Save output
+        if output_file:
+            output_path = Path(output_file)
+        else:
+            input_path = Path(input_file)
+            output_path = input_path.with_suffix('.c')
+        
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_path, 'w') as f:
+                f.write(combined_c_code)
+            
+            print(f"\n✓ Saved combined output to: {output_path}")
+        except Exception as e:
+            print(f"\n✗ Failed to save output: {e}")
+            return {"status": "error", "error": str(e)}
+        
+        return {
+            "status": "success",
+            "input_file": str(input_file),
+            "output_file": str(output_path),
+            "total_functions": len(functions),
+            "successful_functions": len([f for f in decompiled_functions if 'error' not in f]),
+            "failed_functions": len([f for f in decompiled_functions if 'error' in f]),
+            "total_processing_time_seconds": total_elapsed,
+            "functions": decompiled_functions,
+            "c_code": combined_c_code
+        }
+    
+    @staticmethod
+    def _combine_functions_to_c(decompiled_functions: list) -> str:
+        """
+        Combine decompiled functions into a single C file
+        
+        Args:
+            decompiled_functions: List of function dictionaries
+            
+        Returns:
+            Combined C code
+        """
+        output = []
+        
+        # Add header comment
+        output.append("/*")
+        output.append(" * Decompiled PIC16F877A Assembly to C")
+        output.append(f" * Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        output.append(f" * Total functions: {len(decompiled_functions)}")
+        output.append(" */")
+        output.append("")
+        output.append("#include <xc.h>")
+        output.append("")
+        
+        # Add each function
+        for func_data in decompiled_functions:
+            output.append(f"// Function: {func_data['name']}")
+            output.append(f"// Assembly lines: {func_data['assembly_lines']}")
+            
+            if 'error' in func_data:
+                output.append(f"// ERROR: {func_data['error']}")
+            
+            output.append(func_data['c_code'])
+            output.append("")  # Empty line between functions
+        
+        return '\n'.join(output)
+    
+    def decompile_file_original(self, 
+                       input_file: str, 
+                       output_file: Optional[str] = None,
+                       function_name: str = "",
                        context: str = "") -> Dict:
         """
         Decompile a single .lst file
@@ -272,6 +489,11 @@ def parse_args():
         type=str,
         help="Directory containing .lst files"
     )
+    input_group.add_argument(
+        "--input-string",
+        type=str,
+        help="Assembly code as string variable (the assembly to decompile)"
+    )
     
     # Output arguments
     parser.add_argument(
@@ -325,6 +547,11 @@ def parse_args():
         "--keep-comments",
         action="store_true",
         help="Keep comments from .lst file (default: strip)"
+    )
+    parser.add_argument(
+        "--no-function-split",
+        action="store_true",
+        help="Process file as single unit instead of function-by-function (not recommended for large files)"
     )
     
     return parser.parse_args()
@@ -396,17 +623,76 @@ def main():
     print("="*60)
     
     try:
-        if args.input_file:
+        if args.input_string:
+            # String mode - decompile assembly code directly from variable
+            print(f"Assembly code length: {len(args.input_string)} characters")
+            
+            start_time = datetime.now()
+            c_code = decompiler.decompile(
+                args.input_string,
+                args.function_name,
+                args.context
+            )
+            elapsed_time = (datetime.now() - start_time).total_seconds()
+            
+            result = {
+                "status": "success",
+                "input_type": "string",
+                "assembly_length": len(args.input_string),
+                "assembly_lines": len(args.input_string.splitlines()),
+                "c_code": c_code,
+                "c_code_lines": len(c_code.splitlines()),
+                "processing_time_seconds": elapsed_time
+            }
+            
+            # Save output if specified
+            if args.output:
+                try:
+                    output_path = Path(args.output)
+                    output_path.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    with open(output_path, 'w') as f:
+                        f.write(c_code)
+                    
+                    print(f"✓ Saved to: {output_path}")
+                    result["output_file"] = str(output_path)
+                except Exception as e:
+                    print(f"⚠️  Failed to save output: {e}")
+            
+            print(f"✓ Decompilation completed in {elapsed_time:.2f}s")
+            print(f"\n📊 Statistics:")
+            print(f"  - Assembly lines: {result['assembly_lines']}")
+            print(f"  - C code lines: {result['c_code_lines']}")
+            print(f"  - Processing time: {elapsed_time:.2f}s")
+            
+            # Print preview
+            if args.output_format == "c":
+                print("\n" + "="*60)
+                print("GENERATED C CODE (Preview)")
+                print("="*60)
+                preview = c_code[:500] + ("..." if len(c_code) > 500 else "")
+                print(preview)
+        
+        elif args.input_file:
             # Single file mode
             result = decompiler.decompile_file(
                 args.input_file,
                 args.output,
                 args.function_name,
-                args.context
+                args.context,
+                function_by_function=not args.no_function_split  # Use function splitting by default
             )
             
             if result.get('status') == 'success':
                 print("\n✅ Decompilation completed successfully!")
+                
+                # Print statistics
+                if 'total_functions' in result:
+                    print(f"\n📊 Statistics:")
+                    print(f"  - Total functions: {result['total_functions']}")
+                    print(f"  - Successful: {result['successful_functions']}")
+                    print(f"  - Failed: {result['failed_functions']}")
+                    print(f"  - Processing time: {result['total_processing_time_seconds']:.2f}s")
                 
                 # Print preview
                 if args.output_format == "c":
